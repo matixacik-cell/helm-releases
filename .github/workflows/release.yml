@@ -1,0 +1,186 @@
+# Builds, signs and publishes a Helm release. Started only by hand / `node scripts/cloud-release.mjs`
+# in the (private) helm repo: workflow_dispatch, never on push.
+#
+# This repo is public, so its Actions minutes are free (macOS too) and its logs are public:
+# nothing here echoes a secret or prints source files, and nothing is uploaded as a workflow
+# artifact (anyone could download those). Files go straight into a DRAFT release (invisible to
+# every Helm) and the draft is published as Latest only at the very end.
+#
+# Secrets (Settings > Secrets and variables > Actions on THIS repo; only its owner can write here):
+#   HELM_SOURCE_KEY          private half of a READ-ONLY deploy key on matixacik-cell/helm (the source)
+#   HELM_UPDATE_SIGNING_KEY  the Ed25519 update signing key (used only in the last job, which installs no packages)
+#   HELM_TOGETHER_URL / HELM_TOGETHER_KEY  Work together's public client config, baked into the app
+# Set up once with `sh scripts/cloud-release-setup.sh` in the helm repo.
+name: release
+run-name: Helm ${{ inputs.version }} (${{ inputs.ref }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit of matixacik-cell/helm to build
+        required: true
+      version:
+        description: Version (must equal package.json at that ref, e.g. 0.1.11-test.6)
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  SOURCE_REPO: matixacik-cell/helm
+
+jobs:
+  draft:
+    name: Draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Start a fresh draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not a version"; exit 1
+          fi
+          tag="v$VERSION"
+          # A published release is never touched; an old DRAFT of this version is replaced.
+          gh api "repos/$REPO/releases?per_page=100" > releases.json
+          published=$(jq -r --arg t "$tag" '[.[] | select(.tag_name == $t and (.draft | not))] | length' releases.json)
+          if [ "$published" != "0" ]; then echo "::error::$tag is already published"; exit 1; fi
+          for id in $(jq -r --arg t "$tag" '.[] | select(.tag_name == $t and .draft) | .id' releases.json); do
+            gh api -X DELETE "repos/$REPO/releases/$id"
+          done
+          gh release create "$tag" --repo "$REPO" --draft --title "Helm $VERSION" --notes "Helm $VERSION"
+
+  mac:
+    name: Mac (arm64)
+    needs: draft
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    outputs:
+      manifest: ${{ steps.build.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: matixacik-cell/helm
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.HELM_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.0.0
+      - name: Rust (the captain's Mac version)
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - run: npm ci --no-audit --no-fund
+      # The helper apps (Helm Computer / Helm Dictation) are used exactly as committed, never rebuilt:
+      # the build stops unless their cdhash in the app and the zip equals the committed one.
+      - name: Build + safety check
+        id: build
+        env:
+          HELM_TOGETHER_URL: ${{ secrets.HELM_TOGETHER_URL }}
+          HELM_TOGETHER_KEY: ${{ secrets.HELM_TOGETHER_KEY }}
+        run: node scripts/ci/build-release.mjs --platform mac --version "$VERSION" --out release-out
+      - name: Upload to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd release-out
+          gh release upload "v$VERSION" --repo "$REPO" --clobber "Helm-$VERSION-arm64-mac.zip" "Helm-$VERSION-arm64.dmg"
+
+  windows:
+    name: Windows (x64)
+    needs: draft
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    outputs:
+      manifest: ${{ steps.build.outputs.manifest }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Same bytes as the repo (no CRLF): the shipped scripts and skills must equal the Mac build's.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          repository: matixacik-cell/helm
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.HELM_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.0.0
+      # MatthewsPC's toolchain: Rust GNU 1.99.1 + MSYS2 mingw64 binutils (for the Rust tools).
+      - name: Rust GNU + MSYS2 binutils
+        run: |
+          rustup toolchain install 1.99.1-x86_64-pc-windows-gnu --profile minimal
+          rustup default 1.99.1-x86_64-pc-windows-gnu
+          /c/msys64/usr/bin/bash -lc "pacman -Sy --noconfirm --needed mingw-w64-x86_64-binutils"
+      - run: npm ci --no-audit --no-fund
+      - name: Build + safety check
+        id: build
+        env:
+          HELM_TOGETHER_URL: ${{ secrets.HELM_TOGETHER_URL }}
+          HELM_TOGETHER_KEY: ${{ secrets.HELM_TOGETHER_KEY }}
+        run: |
+          export PATH="/c/msys64/mingw64/bin:$PATH"
+          node scripts/ci/build-release.mjs --platform win --version "$VERSION" --out release-out
+      - name: Upload to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd release-out
+          gh release upload "v$VERSION" --repo "$REPO" --clobber "Helm-Setup-$VERSION.exe" "Helm-Setup-$VERSION.exe.blockmap" latest.yml
+
+  publish:
+    name: Sign + publish
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: matixacik-cell/helm
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.HELM_SOURCE_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.0.0
+      # No `npm ci` in this job: release-sign.mjs --ci uses Node's own modules only, so no package
+      # code ever runs while the signing key is on this machine.
+      - name: Download, check hashes, sign, publish as Latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAC_MANIFEST: ${{ needs.mac.outputs.manifest }}
+          WIN_MANIFEST: ${{ needs.windows.outputs.manifest }}
+          SIGNING_KEY: ${{ secrets.HELM_UPDATE_SIGNING_KEY }}
+        run: |
+          set -eu
+          umask 077
+          m="$RUNNER_TEMP/manifests"
+          mkdir -p "$m"
+          printf '%s' "$MAC_MANIFEST" > "$m/manifest-mac.json"
+          printf '%s' "$WIN_MANIFEST" > "$m/manifest-win.json"
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/signing.key"
+          unset SIGNING_KEY
+          trap 'rm -f "$RUNNER_TEMP/signing.key"' EXIT
+          HELM_SIGNING_KEY="$RUNNER_TEMP/signing.key" node scripts/release-sign.mjs --version "$VERSION" --manifests "$m" --publish --ci
